@@ -6,7 +6,10 @@
   "scripts": {
     "build": "tsc",
     "migrate:dev": "prisma migrate dev",
-    "test:classify": "ts-node src/test-classifier.ts"
+    "test:classify": "ts-node src/test-classifier.ts",
+    "worker": "ts-node src/worker.ts",
+    "start": "ts-node src/server.ts",
+    "test:worker": "ts-node src/test-worker.ts"
   },
   "dependencies": {
     "@google/genai": "^2.10.0",
