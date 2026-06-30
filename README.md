@@ -51,16 +51,16 @@ InboxOS is built from the ground up to democratize inbox automation: it is open-
 
 ## 2. Key Features
 
-*   ⚙️ **5-Layer AI Pipeline:** A structured flow that processes raw emails through ingestion, parser, intelligence, rules, action, and delivery layers.
-*   🔌 **Multi-Provider Connectors:** Built-in connectors for Gmail, Outlook (Graph API), and generic IMAP servers with full OAuth 2.0 security.
-*   🧠 **AI Classification Engine:** Automatic sorting of incoming mail into 8 distinct categories (`academic`, `job`, `finance`, `meeting`, `OTP`, `newsletter`, `personal`, `support`) with granular priority scoring ($0$–$100$).
-*   📝 **Smart Action Extraction:** Extracts structured entities: deadlines, action items, monetary amounts, and physical/digital locations.
-*   🎛️ **Rules Engine:** User-defined routing conditions with boolean logic, priority evaluation, and active time-of-day windows.
-*   💬 **Multi-Channel Delivery:** Real-time push alerts to WhatsApp, Slack webhooks, Telegram, email digests, and custom WebSockets.
-*   📊 **Real-Time Dashboard:** Dark glassmorphism dashboard built with Next.js 14 and Tailwind CSS, updating live via WebSocket.
-*   🔒 **Privacy-First AI:** Run fully local intelligence models using Ollama (Llama 3/Mistral) or hook up to commercial endpoints (OpenAI / Gemini).
-*   📦 **Plugin SDK (v3 roadmap):** Unified interfaces for building third-party connectors and execution actions.
-*   👥 **Team Inbox (v3 roadmap):** Multi-user support with ticket assignments, audit logs, and response SLA tracking.
+*  **5-Layer AI Pipeline:** A structured flow that processes raw emails through ingestion, parser, intelligence, rules, action, and delivery layers.
+*  **Multi-Provider Connectors:** Built-in connectors for Gmail, Outlook (Graph API), and generic IMAP servers with full OAuth 2.0 security.
+*  **AI Classification Engine:** Automatic sorting of incoming mail into 8 distinct categories (`academic`, `job`, `finance`, `meeting`, `OTP`, `newsletter`, `personal`, `support`) with granular priority scoring ($0$–$100$).
+*  **Smart Action Extraction:** Extracts structured entities: deadlines, action items, monetary amounts, and physical/digital locations.
+*  **Rules Engine:** User-defined routing conditions with boolean logic, priority evaluation, and active time-of-day windows.
+*  **Multi-Channel Delivery:** Real-time push alerts to WhatsApp, Slack webhooks, Telegram, email digests, and custom WebSockets.
+*  **Real-Time Dashboard:** Dark glassmorphism dashboard built with Next.js 14 and Tailwind CSS, updating live via WebSocket.
+*  **Privacy-First AI:** Run fully local intelligence models using Ollama (Llama 3/Mistral) or hook up to commercial endpoints (OpenAI / Gemini).
+*  **Plugin SDK (v3 roadmap):** Unified interfaces for building third-party connectors and execution actions.
+*  **Team Inbox (v3 roadmap):** Multi-user support with ticket assignments, audit logs, and response SLA tracking.
 
 ---
 
@@ -526,12 +526,12 @@ Increase efficiency inside the dark glassmorphism dashboard UI.
 
 ## 13. Performance Optimizations
 
-*   📡 **Parser Caching:** Parsed multipart email contexts and structures are serialized and stored in Redis with a 24-hour expiration window.
-*   🤖 **AI Batch Classification:** Reduces LLM latency by grouping low-importance emails (such as newsletters and support tickets) and classifying them in batches of 5. Uses a lightweight routing model (like `gpt-4o-mini`) for initial sorting before processing with complex extraction pipelines.
-*   🗂️ **Database Composite Indexing:** High-speed queries are achieved using composite indexes built on `(user_id, received_at DESC)` and `(category, priority_score DESC)`.
-*   🖥️ **Instanced Rendering:** The frontend dashboard list utilizes Virtual Scrolling (`react-window`) to smoothly render long inbox logs containing 10,000+ entries.
-*   ⚡ **Connection Pooling:** Backend connections are managed using `AsyncPG` with SQLALchemy async engines, maintaining connections without initialization lag.
-*   🛡️ **Redis-Backed Throttling:** Protects pipeline processes using rate limiters configured to allow a burst of 50 emails/hour per connected inbox user.
+*  **Parser Caching:** Parsed multipart email contexts and structures are serialized and stored in Redis with a 24-hour expiration window.
+*  **AI Batch Classification:** Reduces LLM latency by grouping low-importance emails (such as newsletters and support tickets) and classifying them in batches of 5. Uses a lightweight routing model (like `gpt-4o-mini`) for initial sorting before processing with complex extraction pipelines.
+*  **Database Composite Indexing:** High-speed queries are achieved using composite indexes built on `(user_id, received_at DESC)` and `(category, priority_score DESC)`.
+*  **Instanced Rendering:** The frontend dashboard list utilizes Virtual Scrolling (`react-window`) to smoothly render long inbox logs containing 10,000+ entries.
+*  **Connection Pooling:** Backend connections are managed using `AsyncPG` with SQLALchemy async engines, maintaining connections without initialization lag.
+*  **Redis-Backed Throttling:** Protects pipeline processes using rate limiters configured to allow a burst of 50 emails/hour per connected inbox user.
 
 ---
 
