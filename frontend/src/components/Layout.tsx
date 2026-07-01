@@ -151,60 +151,58 @@ export const Layout: React.FC<LayoutProps> = ({
       </aside>
 
       {/* ── Mobile Sidebar Drawer ────────────────────────────────────────────────── */}
-      {isMobileMenuOpen && (
-        <div className="fixed inset-0 z-50 flex md:hidden">
-          {/* Backdrop overlay */}
-          <div 
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm"
-            onClick={() => setIsMobileMenuOpen(false)}
-          />
-          
-          {/* Mobile drawer container */}
-          <aside className="relative flex flex-col w-[260px] bg-bg-base border-r border-white/10 h-full p-4 z-50">
-            <div className="flex items-center justify-between pb-6 border-b border-white/5 mb-4">
-              <div className="flex items-center gap-3">
-                <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-600">
-                  <Sparkles size={16} className="text-white" />
-                </div>
-                <h2 className="text-base font-bold text-white">InboxOS</h2>
+      <div className={`fixed inset-0 z-50 flex md:hidden transition-opacity duration-300 ${isMobileMenuOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
+        {/* Backdrop overlay */}
+        <div 
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm transition-opacity duration-300"
+          onClick={() => setIsMobileMenuOpen(false)}
+        />
+        
+        {/* Mobile drawer container */}
+        <aside className={`relative flex flex-col w-[260px] bg-bg-base border-r border-white/10 h-full p-4 z-50 transition-transform duration-300 ease-in-out ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+          <div className="flex items-center justify-between pb-6 border-b border-white/5 mb-4">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-600">
+                <Sparkles size={16} className="text-white" />
               </div>
-              <button 
-                onClick={() => setIsMobileMenuOpen(false)}
-                className="p-1 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white"
-              >
-                <X size={20} />
-              </button>
+              <h2 className="text-base font-bold text-white">InboxOS</h2>
             </div>
-
             <button 
-              onClick={() => {
-                setIsMobileMenuOpen(false);
-                openCompose();
-              }}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm mb-4 transition-all duration-200"
+              onClick={() => setIsMobileMenuOpen(false)}
+              className="p-1 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white"
             >
-              <Plus size={16} />
-              <span>Compose Action</span>
+              <X size={20} />
             </button>
+          </div>
 
-            <nav className="flex-1 space-y-1">
-              {navigationItems.map((item) => (
-                <SidebarItem
-                  key={item.id}
-                  icon={item.icon}
-                  label={item.label}
-                  count={item.count}
-                  active={activeTab === item.id}
-                  onClick={() => {
-                    setActiveTab(item.id);
-                    setIsMobileMenuOpen(false);
-                  }}
-                />
-              ))}
-            </nav>
-          </aside>
-        </div>
-      )}
+          <button 
+            onClick={() => {
+              setIsMobileMenuOpen(false);
+              openCompose();
+            }}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm mb-4 transition-all duration-200"
+          >
+            <Plus size={16} />
+            <span>Compose Action</span>
+          </button>
+
+          <nav className="flex-1 space-y-1">
+            {navigationItems.map((item) => (
+              <SidebarItem
+                key={item.id}
+                icon={item.icon}
+                label={item.label}
+                count={item.count}
+                active={activeTab === item.id}
+                onClick={() => {
+                  setActiveTab(item.id);
+                  setIsMobileMenuOpen(false);
+                }}
+              />
+            ))}
+          </nav>
+        </aside>
+      </div>
 
       {/* ── Main Content Area ────────────────────────────────────────────────────── */}
       <div className="flex flex-col flex-1 min-w-0">
