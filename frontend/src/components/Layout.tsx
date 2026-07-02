@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { SidebarNav } from './SidebarNav';
+import { FloatingActionButton } from './FloatingActionButton';
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -124,6 +125,9 @@ export const Layout: React.FC<LayoutProps> = ({
         </main>
 
       </div>
+
+      {/* Floating Action Button (Mobile) */}
+      <FloatingActionButton />
 
     </div>
   );
