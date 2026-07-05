@@ -43,16 +43,22 @@ import { digestsRouter } from './routes/digests.routes';
 import { notificationsRouter } from './routes/notifications.routes';
 import { feedbackRouter } from './routes/feedback.routes';
 import { integrationsRouter } from './routes/integrations.routes';
+import { remindersRouter } from './routes/reminders.routes';
 
 import { CalendarExtractorService } from './services/actions/calendar-extractor.service';
 import { CalendarCreatorService } from './services/actions/calendar-creator.service';
 import { calendarEventsQueue } from './jobs/calendar-events.job';
+import { ReminderSchedulerService } from './services/actions/reminder-scheduler.service';
 
 const app = express();
 
 // Initialize Firebase Admin SDK if credentials are provided
 let firebaseAdminApp: any = null;
-if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+if (
+  process.env.FIREBASE_PROJECT_ID &&
+  process.env.FIREBASE_CLIENT_EMAIL &&
+  process.env.FIREBASE_PRIVATE_KEY
+) {
   try {
     firebaseAdminApp = initializeApp({
       credential: cert({
@@ -66,17 +72,22 @@ if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && proc
     logger.error('Failed to initialize Firebase Admin SDK:', err);
   }
 } else {
-  logger.warn('Firebase Admin credentials not fully configured in environment variables.');
+  logger.warn(
+    'Firebase Admin credentials not fully configured in environment variables.'
+  );
 }
 
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 8000;
 
 // Security & performance middleware
-app.use(helmet({
-  crossOriginEmbedderPolicy: false,
-  contentSecurityPolicy: process.env.NODE_ENV === 'production' ? undefined : false,
-}));
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy:
+      process.env.NODE_ENV === 'production' ? undefined : false,
+  })
+);
 app.use(compression());
 
 // Request timeout (30 seconds)
@@ -96,14 +107,16 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:3000',
   'http://127.0.0.1:5173',
   ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : []),
-  ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : []),
+  ...(process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
+    : []),
 ];
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (
     origin &&
-    (ALLOWED_ORIGINS.some(o => origin === o) ||
+    (ALLOWED_ORIGINS.some((o) => origin === o) ||
       origin.startsWith('http://localhost:') ||
       origin.startsWith('http://127.0.0.1:'))
   ) {
@@ -323,14 +336,18 @@ app.post('/api/auth/firebase', async (req: Request, res: Response) => {
     }
 
     if (!firebaseAdminApp) {
-      return res.status(500).json({ error: 'Firebase Admin is not configured on this server.' });
+      return res
+        .status(500)
+        .json({ error: 'Firebase Admin is not configured on this server.' });
     }
 
     // Verify token
     const decodedToken = await getAuth().verifyIdToken(idToken);
     const email = decodedToken.email;
     if (!email) {
-      return res.status(400).json({ error: 'Email not present in Firebase token' });
+      return res
+        .status(400)
+        .json({ error: 'Email not present in Firebase token' });
     }
 
     // Check if user exists
@@ -626,6 +643,8 @@ app.get(
           theme: 'dark',
           signature: null,
           autoReply: false,
+          timezone: 'UTC',
+          digestSchedule: 'daily',
         });
       }
 
@@ -633,6 +652,8 @@ app.get(
         theme: settings.theme,
         signature: settings.signature,
         autoReply: settings.autoReply,
+        timezone: settings.timezone,
+        digestSchedule: settings.digestSchedule,
       });
     } catch (error) {
       console.error('Fetch settings error:', error);
@@ -649,6 +670,8 @@ const updateSettingsSchema = z.object({
   theme: z.string().min(1).optional(),
   signature: z.string().nullable().optional(),
   autoReply: z.boolean().optional(),
+  timezone: z.string().min(1).optional(),
+  digestSchedule: z.enum(['daily', 'weekly', 'disabled']).optional(),
 });
 
 app.put(
@@ -669,7 +692,8 @@ app.put(
         });
       }
 
-      const { theme, signature, autoReply } = validation.data;
+      const { theme, signature, autoReply, timezone, digestSchedule } =
+        validation.data;
 
       const updatedSettings = await prisma.userSettings.upsert({
         where: { userId },
@@ -677,14 +701,23 @@ app.put(
           ...(theme !== undefined && { theme }),
           ...(signature !== undefined && { signature }),
           ...(autoReply !== undefined && { autoReply }),
+          ...(timezone !== undefined && { timezone }),
+          ...(digestSchedule !== undefined && { digestSchedule }),
         },
         create: {
           userId,
           theme: theme ?? 'dark',
           signature: signature ?? null,
           autoReply: autoReply ?? false,
+          timezone: timezone ?? 'UTC',
+          digestSchedule: digestSchedule ?? 'daily',
         },
       });
+
+      // Synchronize the BullMQ schedule for the user
+      const { syncDigestSchedule } =
+        await import('./jobs/digest-scheduler.job');
+      await syncDigestSchedule(userId);
 
       return res.status(200).json({
         message: 'Settings updated successfully',
@@ -692,6 +725,8 @@ app.put(
           theme: updatedSettings.theme,
           signature: updatedSettings.signature,
           autoReply: updatedSettings.autoReply,
+          timezone: updatedSettings.timezone,
+          digestSchedule: updatedSettings.digestSchedule,
         },
       });
     } catch (error) {
@@ -872,6 +907,47 @@ app.get(
 );
 
 /**
+ * DELETE /api/integrations/google_calendar
+ * Disconnect Google Calendar integration (deletes database record)
+ */
+app.delete(
+  '/api/integrations/google_calendar',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    try {
+      await prisma.integration.delete({
+        where: {
+          userId_provider: {
+            userId,
+            provider: 'google_calendar',
+          },
+        },
+      });
+      logger.info(
+        `[Calendar] Disconnected Google Calendar for user: ${userId}`
+      );
+      return res.json({
+        success: true,
+        message: 'Google Calendar disconnected successfully',
+      });
+    } catch (error: any) {
+      if (error.code === 'P2025') {
+        // Record to delete does not exist
+        return res.json({
+          success: true,
+          message: 'Google Calendar is already disconnected',
+        });
+      }
+      console.error('Error disconnecting calendar:', error);
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+
+/**
  * GET /api/integrations/google_calendar/auth
  * Generates the Google Calendar OAuth URL.
  */
@@ -879,8 +955,10 @@ app.get(
   '/api/integrations/google_calendar/auth',
   requireAuth,
   (req: AuthenticatedRequest, res: Response) => {
-    const redirectUri = (process.env.GMAIL_REDIRECT_URI || 'http://localhost:8000/api/integrations/gmail/callback')
-      .replace('/gmail/callback', '/google_calendar/callback');
+    const redirectUri = (
+      process.env.GMAIL_REDIRECT_URI ||
+      'http://localhost:8000/api/integrations/gmail/callback'
+    ).replace('/gmail/callback', '/google_calendar/callback');
 
     const calendarOauth2Client = new google.auth.OAuth2(
       process.env.GMAIL_CLIENT_ID,
@@ -892,7 +970,7 @@ app.get(
       access_type: 'offline',
       scope: [
         'https://www.googleapis.com/auth/calendar',
-        'https://www.googleapis.com/auth/calendar.events'
+        'https://www.googleapis.com/auth/calendar.events',
       ],
       prompt: 'consent',
       state: req.user?.userId,
@@ -921,8 +999,10 @@ app.get(
       const calendarOauth2Client = new google.auth.OAuth2(
         process.env.GMAIL_CLIENT_ID,
         process.env.GMAIL_CLIENT_SECRET,
-        (process.env.GMAIL_REDIRECT_URI || 'http://localhost:8000/api/integrations/gmail/callback')
-          .replace('/gmail/callback', '/google_calendar/callback')
+        (
+          process.env.GMAIL_REDIRECT_URI ||
+          'http://localhost:8000/api/integrations/gmail/callback'
+        ).replace('/gmail/callback', '/google_calendar/callback')
       );
 
       const { tokens } = await calendarOauth2Client.getToken(code);
@@ -982,19 +1062,30 @@ app.post(
       }
 
       // 2. Extract Event Details
-      const eventData = CalendarExtractorService.extractEventDetails(email.analysis || email);
+      const eventData = CalendarExtractorService.extractEventDetails(
+        email.analysis || email
+      );
       if (!eventData) {
-        return res.status(400).json({ error: 'No meeting details could be extracted from this email' });
+        return res.status(400).json({
+          error: 'No meeting details could be extracted from this email',
+        });
       }
 
       // 3. Attempt creation
       try {
-        const savedEvent = await CalendarCreatorService.createGoogleCalendarEvent(eventData, userId, emailId);
+        const savedEvent =
+          await CalendarCreatorService.createGoogleCalendarEvent(
+            eventData,
+            userId,
+            emailId
+          );
         return res.status(201).json({ success: true, event: savedEvent });
       } catch (err: any) {
         if (err.message === 'MISSING_GOOGLE_CALENDAR_CREDENTIALS') {
-          logger.info(`[CalendarRoute] Missing credentials. Queueing calendar event creation for email: ${emailId}`);
-          
+          logger.info(
+            `[CalendarRoute] Missing credentials. Queueing calendar event creation for email: ${emailId}`
+          );
+
           // Save a placeholder event with 'pending' status in db
           const pendingEvent = await prisma.calendarEvent.upsert({
             where: {
@@ -1017,21 +1108,26 @@ app.post(
             },
           });
 
-          await calendarEventsQueue.add('createEvent', {
-            userId,
-            emailId,
-            eventData,
-          }, {
-            attempts: 5,
-            backoff: {
-              type: 'exponential',
-              delay: 5000,
+          await calendarEventsQueue.add(
+            'createEvent',
+            {
+              userId,
+              emailId,
+              eventData,
             },
-          });
+            {
+              attempts: 5,
+              backoff: {
+                type: 'exponential',
+                delay: 5000,
+              },
+            }
+          );
 
           return res.status(202).json({
             success: true,
-            message: 'Google Calendar credentials missing. Retrying creation in background.',
+            message:
+              'Google Calendar credentials missing. Retrying creation in background.',
             event: pendingEvent,
           });
         }
@@ -1039,7 +1135,9 @@ app.post(
       }
     } catch (error: any) {
       console.error('Error creating calendar event:', error);
-      return res.status(500).json({ error: error.message || 'Internal Server Error' });
+      return res
+        .status(500)
+        .json({ error: error.message || 'Internal Server Error' });
     }
   }
 );
@@ -1064,6 +1162,9 @@ app.get(
         where: {
           emailId: emailId as string,
           userId: userId as string,
+        },
+        orderBy: {
+          startTime: 'asc',
         },
       });
       return res.json(events);
@@ -1241,7 +1342,6 @@ app.put(
   }
 );
 
-
 /**
  * GET /api/dashboard/stats
  * Returns live dashboard metrics/statistics for the authenticated user.
@@ -1254,99 +1354,381 @@ app.get(
       const userId = req.user?.userId;
       if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
+      const startDateStr = req.query.startDate as string;
+      const endDateStr = req.query.endDate as string;
+
       const now = new Date();
       const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
       const prev24h = new Date(now.getTime() - 48 * 60 * 60 * 1000);
 
-      // 1. Total Ingested
-      const totalIngested = await prisma.email.count({
-        where: { userId },
-      });
-      const last24hIngested = await prisma.email.count({
-        where: { userId, createdAt: { gte: last24h } },
-      });
-      const prev24hIngested = await prisma.email.count({
-        where: { userId, createdAt: { gte: prev24h, lt: last24h } },
-      });
-      let ingestedChange = 0;
-      if (prev24hIngested > 0) {
-        ingestedChange = Math.round(((last24hIngested - prev24hIngested) / prev24hIngested) * 100);
-      } else if (last24hIngested > 0) {
-        ingestedChange = 100;
+      // Default range for analytics elements (last 90 days if not provided)
+      const startDate = startDateStr ? new Date(startDateStr) : new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+      const endDate = endDateStr ? new Date(endDateStr) : now;
+
+      let totalIngestedVal: number;
+      let ingestedChangeStr: string;
+      let ingestedIsPositive: boolean;
+
+      let pendingActionsVal: number;
+      let pendingChangeStr: string;
+      let pendingIsPositive: boolean;
+
+      let resolutionRateVal: number;
+      let resolutionChangeStr: string;
+      let resolutionIsPositive: boolean;
+
+      if (startDateStr || endDateStr) {
+        // ── CALCULATE SCOPED RANGE STATS ──────────────────────────────────────────
+        // 1. Total Ingested
+        const count = await prisma.email.count({
+          where: { userId, createdAt: { gte: startDate, lte: endDate } },
+        });
+        const periodLength = endDate.getTime() - startDate.getTime();
+        const prevStartDate = new Date(startDate.getTime() - periodLength);
+        const prevCount = await prisma.email.count({
+          where: { userId, createdAt: { gte: prevStartDate, lt: startDate } },
+        });
+        let change = 0;
+        if (prevCount > 0) {
+          change = Math.round(((count - prevCount) / prevCount) * 100);
+        } else if (count > 0) {
+          change = 100;
+        }
+        totalIngestedVal = count;
+        ingestedChangeStr = `${change >= 0 ? '+' : ''}${change}%`;
+        ingestedIsPositive = change >= 0;
+
+        // 2. Urgent / Pending Actions
+        const pending = await prisma.actionItem.count({
+          where: {
+            isCompleted: false,
+            email: { userId },
+            createdAt: { gte: startDate, lte: endDate },
+          },
+        });
+        const prevPending = await prisma.actionItem.count({
+          where: {
+            isCompleted: false,
+            email: { userId },
+            createdAt: { gte: prevStartDate, lt: startDate },
+          },
+        });
+        let pChange = 0;
+        if (prevPending > 0) {
+          pChange = Math.round(((pending - prevPending) / prevPending) * 100);
+        } else if (pending > 0) {
+          pChange = 100;
+        }
+        pendingActionsVal = pending;
+        pendingChangeStr = `${pChange >= 0 ? '+' : ''}${pChange}%`;
+        pendingIsPositive = pChange <= 0; // decrease is positive
+
+        // 3. Resolution Rate
+        const totalT = await prisma.actionItem.count({
+          where: { email: { userId }, createdAt: { gte: startDate, lte: endDate } },
+        });
+        const completedT = await prisma.actionItem.count({
+          where: { isCompleted: true, email: { userId }, createdAt: { gte: startDate, lte: endDate } },
+        });
+        const resRate = totalT > 0 ? Math.round((completedT / totalT) * 100) : 0;
+
+        const prevTotalT = await prisma.actionItem.count({
+          where: { email: { userId }, createdAt: { gte: prevStartDate, lt: startDate } },
+        });
+        const prevCompletedT = await prisma.actionItem.count({
+          where: { isCompleted: true, email: { userId }, createdAt: { gte: prevStartDate, lt: startDate } },
+        });
+        const prevResRate = prevTotalT > 0 ? Math.round((prevCompletedT / prevTotalT) * 100) : 0;
+
+        const rChange = resRate - prevResRate;
+        resolutionRateVal = resRate;
+        resolutionChangeStr = `${rChange >= 0 ? '+' : ''}${rChange}%`;
+        resolutionIsPositive = rChange >= 0;
+      } else {
+        // ── CALCULATE LIFETIME/24H STATS (Backwards Compatibility) ──────────────────
+        // 1. Total Ingested
+        const totalIngested = await prisma.email.count({
+          where: { userId },
+        });
+        const last24hIngested = await prisma.email.count({
+          where: { userId, createdAt: { gte: last24h } },
+        });
+        const prev24hIngested = await prisma.email.count({
+          where: { userId, createdAt: { gte: prev24h, lt: last24h } },
+        });
+        let ingestedChange = 0;
+        if (prev24hIngested > 0) {
+          ingestedChange = Math.round(((last24hIngested - prev24hIngested) / prev24hIngested) * 100);
+        } else if (last24hIngested > 0) {
+          ingestedChange = 100;
+        }
+        totalIngestedVal = totalIngested;
+        ingestedChangeStr = `${ingestedChange >= 0 ? '+' : ''}${ingestedChange}%`;
+        ingestedIsPositive = ingestedChange >= 0;
+
+        // 2. Urgent / Pending Actions
+        const pendingActions = await prisma.actionItem.count({
+          where: {
+            isCompleted: false,
+            email: { userId },
+          },
+        });
+        const last24hPending = await prisma.actionItem.count({
+          where: {
+            isCompleted: false,
+            email: { userId },
+            createdAt: { gte: last24h },
+          },
+        });
+        const prev24hPending = await prisma.actionItem.count({
+          where: {
+            isCompleted: false,
+            email: { userId },
+            createdAt: { gte: prev24h, lt: last24h },
+          },
+        });
+        let pendingChange = 0;
+        if (prev24hPending > 0) {
+          pendingChange = Math.round(((last24hPending - prev24hPending) / prev24hPending) * 100);
+        } else if (last24hPending > 0) {
+          pendingChange = 100;
+        }
+        pendingActionsVal = pendingActions;
+        pendingChangeStr = `${pendingChange >= 0 ? '+' : ''}${pendingChange}%`;
+        pendingIsPositive = pendingChange <= 0;
+
+        // 3. Resolved Rate
+        const totalTasks = await prisma.actionItem.count({
+          where: { email: { userId } },
+        });
+        const completedTasks = await prisma.actionItem.count({
+          where: { isCompleted: true, email: { userId } },
+        });
+        const resolutionRate = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+
+        const prevTotalTasks = await prisma.actionItem.count({
+          where: { email: { userId }, createdAt: { lt: last24h } },
+        });
+        const prevCompletedTasks = await prisma.actionItem.count({
+          where: { isCompleted: true, email: { userId }, createdAt: { lt: last24h } },
+        });
+        const prevResolutionRate = prevTotalTasks > 0 ? Math.round((prevCompletedTasks / prevTotalTasks) * 100) : 0;
+
+        let resolutionChange = 0;
+        if (prevResolutionRate > 0) {
+          resolutionChange = Math.round(((resolutionRate - prevResolutionRate) / prevResolutionRate) * 100);
+        } else if (resolutionRate > 0) {
+          resolutionChange = 100;
+        }
+        resolutionRateVal = resolutionRate;
+        resolutionChangeStr = `${resolutionChange >= 0 ? '+' : ''}${resolutionChange}%`;
+        resolutionIsPositive = resolutionChange >= 0;
       }
 
-      // 2. Urgent / Pending Actions
-      const pendingActions = await prisma.actionItem.count({
+      // 4. Category Breakdown
+      const categoriesRaw = await prisma.email.groupBy({
+        by: ['category'],
         where: {
-          isCompleted: false,
-          email: { userId },
+          userId,
+          createdAt: { gte: startDate, lte: endDate },
+        },
+        _count: {
+          id: true,
         },
       });
-      const last24hPending = await prisma.actionItem.count({
+      const categoryBreakdown = categoriesRaw.map((item) => ({
+        category: item.category || 'Uncategorized',
+        count: item._count.id,
+      }));
+
+      // 5. Priority Trends (grouped by day)
+      const emailsWithPriority = await prisma.email.findMany({
         where: {
-          isCompleted: false,
-          email: { userId },
-          createdAt: { gte: last24h },
+          userId,
+          createdAt: { gte: startDate, lte: endDate },
+        },
+        select: {
+          createdAt: true,
+          analysis: {
+            select: {
+              priorityScore: true,
+            },
+          },
         },
       });
-      const prev24hPending = await prisma.actionItem.count({
-        where: {
-          isCompleted: false,
-          email: { userId },
-          createdAt: { gte: prev24h, lt: last24h },
-        },
-      });
-      let pendingChange = 0;
-      if (prev24hPending > 0) {
-        pendingChange = Math.round(((last24hPending - prev24hPending) / prev24hPending) * 100);
-      } else if (last24hPending > 0) {
-        pendingChange = 100;
+      const trendsMap: { [date: string]: { total: number; count: number } } = {};
+      const dIter = new Date(startDate.getTime());
+      // Fill the range daily mapping
+      while (dIter <= endDate) {
+        const dateStr = dIter.toISOString().split('T')[0];
+        trendsMap[dateStr] = { total: 0, count: 0 };
+        dIter.setDate(dIter.getDate() + 1);
       }
 
-      // 3. Resolved Rate
-      const totalTasks = await prisma.actionItem.count({
-        where: { email: { userId } },
+      emailsWithPriority.forEach((email) => {
+        const dateStr = email.createdAt.toISOString().split('T')[0];
+        const score = email.analysis?.priorityScore ?? 0.0;
+        if (trendsMap[dateStr] !== undefined) {
+          trendsMap[dateStr].total += score;
+          trendsMap[dateStr].count += 1;
+        }
       });
-      const completedTasks = await prisma.actionItem.count({
-        where: { isCompleted: true, email: { userId } },
-      });
-      const resolutionRate = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+      const priorityTrends = Object.entries(trendsMap)
+        .map(([date, data]) => ({
+          date,
+          avgPriority: data.count > 0 ? Number((data.total / data.count).toFixed(2)) : 0.0,
+        }))
+        .sort((a, b) => a.date.localeCompare(b.date));
 
-      // Previous 24h resolution rate to calculate trend
-      const prevTotalTasks = await prisma.actionItem.count({
-        where: { email: { userId }, createdAt: { lt: last24h } },
+      // 6. Action Completion Metrics
+      const actionItems = await prisma.actionItem.findMany({
+        where: {
+          email: { userId },
+          createdAt: { gte: startDate, lte: endDate },
+        },
+        select: {
+          isCompleted: true,
+        },
       });
-      const prevCompletedTasks = await prisma.actionItem.count({
-        where: { isCompleted: true, email: { userId }, createdAt: { lt: last24h } },
-      });
-      const prevResolutionRate = prevTotalTasks > 0 ? Math.round((prevCompletedTasks / prevTotalTasks) * 100) : 0;
 
-      let resolutionChange = 0;
-      if (prevResolutionRate > 0) {
-        resolutionChange = Math.round(((resolutionRate - prevResolutionRate) / prevResolutionRate) * 100);
-      } else if (resolutionRate > 0) {
-        resolutionChange = 100;
-      }
+      let completedCount = 0;
+      let pendingCount = 0;
+      actionItems.forEach((item) => {
+        if (item.isCompleted) {
+          completedCount++;
+        } else {
+          pendingCount++;
+        }
+      });
+
+      const actionCompletion = {
+        completed: completedCount,
+        pending: pendingCount,
+        total: completedCount + pendingCount,
+      };
+
+      // 7. Top Senders Table
+      const sendersRaw = await prisma.email.groupBy({
+        by: ['sender'],
+        where: {
+          userId,
+          createdAt: { gte: startDate, lte: endDate },
+        },
+        _count: {
+          id: true,
+        },
+        orderBy: {
+          _count: {
+            id: 'desc',
+          },
+        },
+        take: 10,
+      });
+
+      const topSenders = sendersRaw.map((item) => ({
+        sender: item.sender,
+        count: item._count.id,
+        name: item.sender.split('@')[0],
+      }));
 
       return res.status(200).json({
         totalIngested: {
-          value: totalIngested,
-          change: `${ingestedChange >= 0 ? '+' : ''}${ingestedChange}%`,
-          isPositive: ingestedChange >= 0,
+          value: totalIngestedVal,
+          change: ingestedChangeStr,
+          isPositive: ingestedIsPositive,
         },
         pendingActions: {
-          value: pendingActions,
-          change: `${pendingChange >= 0 ? '+' : ''}${pendingChange}%`,
-          isPositive: pendingChange <= 0, // decrease in pending items is positive
+          value: pendingActionsVal,
+          change: pendingChangeStr,
+          isPositive: pendingIsPositive,
         },
         resolutionRate: {
-          value: `${resolutionRate}%`,
-          change: `${resolutionChange >= 0 ? '+' : ''}${resolutionChange}%`,
-          isPositive: resolutionChange >= 0,
+          value: `${resolutionRateVal}%`,
+          change: resolutionChangeStr,
+          isPositive: resolutionIsPositive,
         },
+        categoryBreakdown,
+        priorityTrends,
+        actionCompletion,
+        topSenders,
       });
     } catch (error) {
       console.error('Failed to calculate dashboard stats:', error);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
+/**
+ * GET /api/dashboard/heatmap
+ * Returns daily and hourly volume statistics for user's emails within the specified range.
+ */
+app.get(
+  '/api/dashboard/heatmap',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const startDateStr = req.query.startDate as string;
+      const endDateStr = req.query.endDate as string;
+
+      const now = new Date();
+      const startDate = startDateStr ? new Date(startDateStr) : new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+      const endDate = endDateStr ? new Date(endDateStr) : now;
+
+      const emails = await prisma.email.findMany({
+        where: {
+          userId,
+          createdAt: { gte: startDate, lte: endDate },
+        },
+        select: {
+          createdAt: true,
+        },
+      });
+
+      // Prepare daily map
+      const dailyMap: { [date: string]: number } = {};
+      const dIter = new Date(startDate.getTime());
+      while (dIter <= endDate) {
+        const dateStr = dIter.toISOString().split('T')[0];
+        dailyMap[dateStr] = 0;
+        dIter.setDate(dIter.getDate() + 1);
+      }
+
+      // Group by hour and day of week
+      const hourlyGrid: { [key: string]: number } = {};
+      for (let d = 0; d < 7; d++) {
+        for (let h = 0; h < 24; h++) {
+          hourlyGrid[`${d}-${h}`] = 0;
+        }
+      }
+
+      emails.forEach((email) => {
+        const dateStr = email.createdAt.toISOString().split('T')[0];
+        if (dailyMap[dateStr] !== undefined) {
+          dailyMap[dateStr] += 1;
+        }
+
+        const dayOfWeek = email.createdAt.getDay();
+        const hour = email.createdAt.getHours();
+        hourlyGrid[`${dayOfWeek}-${hour}`] += 1;
+      });
+
+      const daily = Object.entries(dailyMap).map(([date, count]) => ({
+        date,
+        count,
+      })).sort((a, b) => a.date.localeCompare(b.date));
+
+      const hourly = Object.entries(hourlyGrid).map(([key, count]) => {
+        const [dayOfWeek, hour] = key.split('-').map(Number);
+        return { dayOfWeek, hour, count };
+      });
+
+      return res.status(200).json({ daily, hourly });
+    } catch (error) {
+      console.error('Failed to calculate heatmap data:', error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   }
@@ -1434,10 +1816,7 @@ app.get(
       // Search query object
       const searchFilter = {
         userId,
-        OR: [
-          { subject: { contains: q } },
-          { body: { contains: q } },
-        ],
+        OR: [{ subject: { contains: q } }, { body: { contains: q } }],
       };
 
       // Run both count and select queries concurrently
@@ -1821,25 +2200,30 @@ app.get('/api/auth/google', (req: Request, res: Response) => {
  * POST /api/auth/refresh
  * Refresh JWT token using existing valid cookie token.
  */
-app.post('/api/auth/refresh', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const userId = req.user?.userId;
-    const email = req.user?.email;
-    if (!userId || !email) return res.status(401).json({ error: 'Unauthorized' });
+app.post(
+  '/api/auth/refresh',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.userId;
+      const email = req.user?.email;
+      if (!userId || !email)
+        return res.status(401).json({ error: 'Unauthorized' });
 
-    const newToken = AuthService.generateToken(userId, email);
-    res.cookie('token', newToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 24 * 60 * 60 * 1000,
-    });
-    return res.json({ message: 'Token refreshed successfully' });
-  } catch (err: any) {
-    logger.error('[Auth] Refresh error:', err.message);
-    return res.status(500).json({ error: 'Failed to refresh token' });
+      const newToken = AuthService.generateToken(userId, email);
+      res.cookie('token', newToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 24 * 60 * 60 * 1000,
+      });
+      return res.json({ message: 'Token refreshed successfully' });
+    } catch (err: any) {
+      logger.error('[Auth] Refresh error:', err.message);
+      return res.status(500).json({ error: 'Failed to refresh token' });
+    }
   }
-});
+);
 
 /**
  * PUT /api/users/profile
@@ -1859,7 +2243,10 @@ app.put(
 
       const validation = updateProfileSchema.safeParse(req.body);
       if (!validation.success) {
-        return res.status(400).json({ error: 'Invalid payload', details: validation.error.flatten() });
+        return res.status(400).json({
+          error: 'Invalid payload',
+          details: validation.error.flatten(),
+        });
       }
 
       const { email } = validation.data;
@@ -1914,6 +2301,107 @@ app.get(
   }
 );
 
+// ─── Reminder System Routes ───────────────────────────────────────────────────
+
+/**
+ * GET /api/reminders/upcoming
+ * Returns active reminders (PENDING/SNOOZED) within next 7 days for the user.
+ */
+app.get(
+  '/api/reminders/upcoming',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const now = new Date();
+      const in7Days = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+      const reminders = await prisma.reminder.findMany({
+        where: {
+          userId,
+          status: { in: ['PENDING', 'SNOOZED'] },
+          deadline: { gte: new Date(now.getTime() - 24 * 60 * 60 * 1000) }, // include up to 24h overdue
+        },
+        orderBy: { deadline: 'asc' },
+        take: 20,
+        include: {
+          email: { select: { subject: true, sender: true } },
+        },
+      });
+
+      return res.json({ reminders, total: reminders.length });
+    } catch (err: any) {
+      logger.error('GET /api/reminders/upcoming error:', err);
+      return res.status(500).json({ error: 'Failed to fetch reminders' });
+    }
+  }
+);
+
+/**
+ * POST /api/reminders/:id/snooze
+ * Snoozes a reminder for durationMinutes.
+ */
+app.post(
+  '/api/reminders/:id/snooze',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const id = req.params.id as string;
+      const { durationMinutes } = req.body;
+
+      if (!durationMinutes || typeof durationMinutes !== 'number' || durationMinutes <= 0) {
+        return res.status(400).json({ error: 'durationMinutes must be a positive number' });
+      }
+
+      const reminder = await prisma.reminder.findUnique({ where: { id } });
+      if (!reminder || reminder.userId !== userId) {
+        return res.status(404).json({ error: 'Reminder not found' });
+      }
+
+      const updated = await ReminderSchedulerService.snoozeReminder(id, durationMinutes);
+      return res.json({ message: 'Reminder snoozed', reminder: updated });
+    } catch (err: any) {
+      logger.error('POST /api/reminders/:id/snooze error:', err);
+      return res.status(500).json({ error: err.message || 'Failed to snooze reminder' });
+    }
+  }
+);
+
+/**
+ * POST /api/reminders/:id/cancel
+ * Cancels a specific reminder.
+ */
+app.post(
+  '/api/reminders/:id/cancel',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const id = req.params.id as string;
+      const reminder = await prisma.reminder.findUnique({ where: { id } });
+      if (!reminder || reminder.userId !== userId) {
+        return res.status(404).json({ error: 'Reminder not found' });
+      }
+
+      if (!reminder.emailId) {
+        return res.status(400).json({ error: 'Reminder has no associated emailId' });
+      }
+      await ReminderSchedulerService.cancelReminders(reminder.emailId);
+      return res.json({ message: 'Reminder cancelled' });
+    } catch (err: any) {
+      logger.error('POST /api/reminders/:id/cancel error:', err);
+      return res.status(500).json({ error: 'Failed to cancel reminder' });
+    }
+  }
+);
+
 /**
  * GET /api/users/me/dnd
  * Get Do Not Disturb settings
@@ -1926,7 +2414,9 @@ app.get(
       const userId = req.user?.userId;
       if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-      const settings = await prisma.userSettings.findUnique({ where: { userId } });
+      const settings = await prisma.userSettings.findUnique({
+        where: { userId },
+      });
       return res.json({
         dndEnabled: settings?.dndEnabled || false,
         dndStart: settings?.dndStart || null,
@@ -1941,8 +2431,16 @@ app.get(
 
 const dndSchema = z.object({
   dndEnabled: z.boolean(),
-  dndStart: z.string().regex(/^\d{2}:\d{2}$/).optional().nullable(),
-  dndEnd: z.string().regex(/^\d{2}:\d{2}$/).optional().nullable(),
+  dndStart: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/)
+    .optional()
+    .nullable(),
+  dndEnd: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/)
+    .optional()
+    .nullable(),
 });
 
 /**
@@ -1959,18 +2457,34 @@ app.post(
 
       const validation = dndSchema.safeParse(req.body);
       if (!validation.success) {
-        return res.status(400).json({ error: 'Invalid payload', details: validation.error.flatten() });
+        return res.status(400).json({
+          error: 'Invalid payload',
+          details: validation.error.flatten(),
+        });
       }
 
       const { dndEnabled, dndStart, dndEnd } = validation.data;
       const settings = await prisma.userSettings.upsert({
         where: { userId },
-        update: { dndEnabled, dndStart: dndStart ?? null, dndEnd: dndEnd ?? null },
-        create: { userId, dndEnabled, dndStart: dndStart ?? null, dndEnd: dndEnd ?? null },
+        update: {
+          dndEnabled,
+          dndStart: dndStart ?? null,
+          dndEnd: dndEnd ?? null,
+        },
+        create: {
+          userId,
+          dndEnabled,
+          dndStart: dndStart ?? null,
+          dndEnd: dndEnd ?? null,
+        },
       });
 
       logger.info('[Users] DnD settings updated', { userId, dndEnabled });
-      return res.json({ dndEnabled: settings.dndEnabled, dndStart: settings.dndStart, dndEnd: settings.dndEnd });
+      return res.json({
+        dndEnabled: settings.dndEnabled,
+        dndStart: settings.dndStart,
+        dndEnd: settings.dndEnd,
+      });
     } catch (err: any) {
       logger.error('[Users] POST /me/dnd error:', err.message);
       return res.status(500).json({ error: 'Failed to update DnD settings' });
@@ -1979,26 +2493,108 @@ app.post(
 );
 
 /**
- * POST /api/emails/:id/read
- * Mark an email as read
+ * GET /api/notifications
+ * Returns unread notifications for the authenticated user.
  */
-app.post(
-  '/api/emails/:id/read',
+app.get(
+  '/api/notifications',
   requireAuth,
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user?.userId;
       if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const limit = parseInt(req.query.limit as string) || 20;
+      const unreadOnly = req.query.unread !== 'false';
+
+      const notifications = await prisma.notification.findMany({
+        where: { userId, ...(unreadOnly && { isRead: false }) },
+        orderBy: { sentAt: 'desc' },
+        take: limit,
+        include: {
+          reminder: { select: { deadline: true, emailId: true } },
+        },
+      });
+
+      return res.json({ notifications, total: notifications.length });
+    } catch (err: any) {
+      logger.error('GET /api/notifications error:', err);
+      return res.status(500).json({ error: 'Failed to fetch notifications' });
+    }
+  }
+);
+
+/**
+ * PATCH /api/notifications/:id/read
+ * Marks a notification as read.
+ */
+app.patch(
+  '/api/notifications/:id/read',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const id = req.params.id as string;
+      const notif = await prisma.notification.findUnique({ where: { id } });
+      if (!notif || notif.userId !== userId) {
+        return res.status(404).json({ error: 'Notification not found' });
+      }
+
+      await prisma.notification.update({ where: { id }, data: { isRead: true } });
+      return res.json({ message: 'Notification marked as read' });
+    } catch (err: any) {
+      logger.error('PATCH /api/notifications/:id/read error:', err);
+      return res.status(500).json({ error: 'Failed to mark notification' });
+    }
+  }
+);
+
+/**
+ * PATCH /api/action-items/:id/done
+ * Marks an action item as completed and cancels associated reminders.
+ */
+app.patch(
+  '/api/action-items/:id/done',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
       const id = req.params.id as string;
 
-      const email = await prisma.email.findUnique({ where: { id } });
-      if (!email || email.userId !== userId) return res.status(404).json({ error: 'Email not found' });
+      // Fetch action item + verify ownership via email
+      const actionItem = await prisma.actionItem.findUnique({ where: { id } });
+      if (!actionItem) {
+        return res.status(404).json({ error: 'Action item not found' });
+      }
 
-      await prisma.email.update({ where: { id }, data: { status: 'READ' } });
-      return res.json({ message: 'Email marked as read' });
+      // Verify the parent email belongs to this user
+      const parentEmail = await prisma.email.findUnique({
+        where: { id: actionItem.emailId },
+        select: { userId: true },
+      });
+      if (!parentEmail || parentEmail.userId !== userId) {
+        return res.status(404).json({ error: 'Action item not found' });
+      }
+
+      // Mark action item done
+      const updated = await prisma.actionItem.update({
+        where: { id },
+        data: { isCompleted: true },
+      });
+
+      // Cancel all pending reminders for this email (non-blocking)
+      ReminderSchedulerService.cancelReminders(actionItem.emailId).catch((err: any) => {
+        logger.error('Failed to cancel reminders on action done:', err);
+      });
+
+      return res.json({ message: 'Action item marked done', actionItem: updated });
     } catch (err: any) {
-      logger.error('[Emails] POST /:id/read error:', err.message);
-      return res.status(500).json({ error: 'Failed to mark email as read' });
+      logger.error('PATCH /api/action-items/:id/done error:', err);
+      return res.status(500).json({ error: 'Failed to mark action item done' });
     }
   }
 );
@@ -2017,9 +2613,13 @@ app.post(
       const id = req.params.id as string;
 
       const email = await prisma.email.findUnique({ where: { id } });
-      if (!email || email.userId !== userId) return res.status(404).json({ error: 'Email not found' });
+      if (!email || email.userId !== userId)
+        return res.status(404).json({ error: 'Email not found' });
 
-      await prisma.email.update({ where: { id }, data: { status: 'ARCHIVED' } });
+      await prisma.email.update({
+        where: { id },
+        data: { status: 'ARCHIVED' },
+      });
       logger.info('[Emails] Email archived', { id, userId });
       return res.json({ message: 'Email archived successfully' });
     } catch (err: any) {
@@ -2043,7 +2643,8 @@ app.delete(
       const id = req.params.id as string;
 
       const email = await prisma.email.findUnique({ where: { id } });
-      if (!email || email.userId !== userId) return res.status(404).json({ error: 'Email not found' });
+      if (!email || email.userId !== userId)
+        return res.status(404).json({ error: 'Email not found' });
 
       await prisma.email.delete({ where: { id } });
       logger.info('[Emails] Email deleted', { id, userId });
@@ -2076,23 +2677,10 @@ app.get(
         orderBy: { createdAt: 'asc' },
       });
 
-      // Build heatmap: { dayOfWeek: { hour: count } }
-      const heatmap: Record<number, Record<number, number>> = {};
-      for (let d = 0; d < 7; d++) {
-        heatmap[d] = {};
-        for (let h = 0; h < 24; h++) heatmap[d][h] = 0;
-      }
-
-      for (const email of emails) {
-        const d = email.createdAt.getDay();
-        const h = email.createdAt.getHours();
-        heatmap[d][h] = (heatmap[d][h] || 0) + 1;
-      }
-
-      return res.json({ heatmap, totalEmails: emails.length, days });
+      return res.json({ emails });
     } catch (err: any) {
       logger.error('[Dashboard] GET /heatmap error:', err.message);
-      return res.status(500).json({ error: 'Failed to generate heatmap' });
+      return res.status(500).json({ error: 'Failed to fetch heatmap data' });
     }
   }
 );
@@ -2102,13 +2690,13 @@ app.use('/api/rag', ragRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/tasks', tasksRouter);
 app.use('/api/calendar/events', calendarRouter);
+app.use('/api/actions/calendar/events', calendarRouter);
 app.use('/api/expenses', expensesRouter);
 app.use('/api/digests', digestsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/feedback', feedbackRouter);
 app.use('/api/integrations', integrationsRouter);
-
-
+app.use('/api/reminders', remindersRouter);
 // Start Server
 
 const server = app.listen(PORT, () => {
@@ -2130,6 +2718,9 @@ const server = app.listen(PORT, () => {
   TelegramBotService.init().catch((err) => {
     logger.error('Failed to initialize Telegram Bot Service:', err);
   });
+
+  // Initialize Reminder Worker (BullMQ)
+  ReminderSchedulerService.initWorker();
 });
 
 // Initialize Socket.io Server with client-credentials CORS configuration
@@ -2155,6 +2746,9 @@ WebSocketService.initialize(io);
 const gracefulShutdown = () => {
   logger.info('Received shutdown signal. Starting graceful cleanup...');
   TelegramBotService.shutdown();
+  ReminderSchedulerService.shutdown().catch((err) =>
+    logger.error('Failed to shutdown ReminderScheduler:', err)
+  );
   server.close(() => {
     logger.info('HTTP server closed.');
     prisma.$disconnect().then(() => {
