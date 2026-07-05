@@ -904,6 +904,16 @@ If there are no explicit, concrete tasks, return an empty array.`;
 
     if (provider === 'gemini') {
       embedding = await this.generateEmbeddingWithGemini(textToEmbed);
+    } else if (provider === 'ollama') {
+      try {
+        embedding = await OllamaProvider.generateEmbedding(textToEmbed);
+      } catch (error) {
+        console.warn(
+          `[AIService] Ollama embedding generation failed or unreachable. Falling back to OpenAI. Error:`,
+          error
+        );
+        embedding = await this.generateEmbeddingWithOpenAI(textToEmbed);
+      }
     } else {
       embedding = await this.generateEmbeddingWithOpenAI(textToEmbed);
     }
@@ -1051,6 +1061,16 @@ If there are no explicit, concrete tasks, return an empty array.`;
 
     if (provider === 'gemini') {
       queryEmbedding = await this.generateEmbeddingWithGemini(query);
+    } else if (provider === 'ollama') {
+      try {
+        queryEmbedding = await OllamaProvider.generateEmbedding(query);
+      } catch (error) {
+        console.warn(
+          `[AIService] Ollama embedding query generation failed or unreachable. Falling back to OpenAI. Error:`,
+          error
+        );
+        queryEmbedding = await this.generateEmbeddingWithOpenAI(query);
+      }
     } else {
       queryEmbedding = await this.generateEmbeddingWithOpenAI(query);
     }
@@ -1158,6 +1178,23 @@ If there are no explicit, concrete tasks, return an empty array.`;
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
         });
         return response.text || '';
+      } else if (provider === 'ollama') {
+        try {
+          return await OllamaProvider.generate(prompt);
+        } catch (error) {
+          console.warn(
+            `[AIService] Ollama generateReply failed or unreachable. Falling back to OpenAI. Error:`,
+            error
+          );
+          const openai = this.getOpenAI();
+          const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 1500,
+            temperature: 0.7,
+          });
+          return response.choices[0]?.message?.content || '';
+        }
       } else {
         const openai = this.getOpenAI();
         const response = await openai.chat.completions.create({
@@ -1222,6 +1259,16 @@ Provide the result as a JSON object with a single field 'category'.`;
         });
         const parsed = JSON.parse(response.text || '{}');
         return parsed.category || 'other';
+      } else if (provider === 'ollama') {
+        try {
+          return await OllamaProvider.categorizeLink(href, text);
+        } catch (error) {
+          console.warn(
+            `[AIService] Ollama link categorization failed or unreachable. Falling back to OpenAI. Error:`,
+            error
+          );
+          return await this.categorizeLinkWithOpenAI(systemPrompt, userPrompt);
+        }
       } else if (provider === 'mock') {
         const lowerHref = href.toLowerCase();
         if (
