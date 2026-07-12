@@ -18,12 +18,37 @@ import { RedisService } from './services/redis.service';
 import { google } from 'googleapis';
 import crypto from 'crypto';
 import { EmailSenderService } from './services/email-sender.service';
-import { encrypt } from './utils/crypto';
+import { encrypt, decrypt } from './utils/crypto';
 import { registerWorkerHandlers } from './worker';
 import { Server as SocketIoServer } from 'socket.io';
 import { WebSocketService } from './services/websocket.service';
+// Firebase Admin — modular v14 imports
+import { initializeApp as firebaseInitializeApp, getApps, cert } from 'firebase-admin/app';
+import { getAuth as firebaseGetAuth } from 'firebase-admin/auth';
 
 import { setupSwagger } from './config/swagger';
+import { GmailSyncService } from './services/gmail-sync.service';
+import { TelegramBotService } from './services/telegram-bot.service';
+import { TelegramConfig } from './config/telegram.config';
+
+// ── Firebase Admin SDK Initialization ────────────────────────────────────────
+// Only initialize once; guard against hot-reload double-init in dev mode.
+if (!getApps().length) {
+  try {
+    firebaseInitializeApp({
+      credential: cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        // .env stores literal \n — Node needs real newlines
+        privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+      }),
+    });
+    logger.info('Firebase Admin SDK initialized');
+  } catch (err: any) {
+    logger.warn('Firebase Admin SDK init failed (Google Sign-In will be unavailable):', err.message);
+  }
+}
+
 
 import { aiRouter } from './routes/ai.routes';
 import { calendarRouter } from './routes/calendar.routes';
@@ -40,15 +65,32 @@ const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 8000;
 
+const allowedOrigins = [
+  'http://localhost',
+  'http://127.0.0.1',
+  'https://inbox-os-frontend.vercel.app'
+];
+
+if (process.env.FRONTEND_URL) {
+  allowedOrigins.push(process.env.FRONTEND_URL.replace(/\/$/, ''));
+}
+if (process.env.ALLOWED_ORIGINS) {
+  process.env.ALLOWED_ORIGINS.split(',').forEach(o => allowedOrigins.push(o.trim().replace(/\/$/, '')));
+}
+
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (
-    origin === 'http://localhost' ||
-    origin.startsWith('http://localhost:') ||
-    origin === 'http://127.0.0.1' ||
-    origin.startsWith('http://127.0.0.1:')
-  )) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
+  if (origin) {
+    const originClean = origin.replace(/\/$/, '');
+    const isVercelPreview = originClean.startsWith('https://inbox-os-frontend') && originClean.endsWith('.vercel.app');
+    const isAllowed = isVercelPreview || allowedOrigins.some(o => 
+      originClean === o || 
+      (o.startsWith('http://localhost') && originClean.startsWith('http://localhost:')) ||
+      (o.startsWith('http://127.0.0.1') && originClean.startsWith('http://127.0.0.1:'))
+    );
+    if (isAllowed) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
   }
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS,PATCH');
@@ -59,6 +101,7 @@ app.use((req, res, next) => {
   }
   next();
 });
+
 
 /**
  * @swagger
@@ -226,12 +269,13 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
     res.cookie('token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 24 * 60 * 60 * 1000, // 24 hours
     });
 
     return res.status(201).json({
       message: 'User registered successfully',
+      token,
       user: {
         id: newUser.id,
         email: newUser.email,
@@ -323,12 +367,13 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
     res.cookie('token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 24 * 60 * 60 * 1000, // 24 hours
     });
 
     return res.status(200).json({
       message: 'Logged in successfully',
+      token,
       user: {
         id: user.id,
         email: user.email,
@@ -362,7 +407,11 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
  *         description: Internal server error
  */
 app.post('/api/auth/logout', (_req: Request, res: Response) => {
-  res.clearCookie('token');
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+  });
   return res.status(200).json({ message: 'Logged out successfully' });
 });
 
@@ -392,6 +441,233 @@ app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) 
   return res.status(200).json({
     user: req.user,
   });
+});
+
+/**
+ * POST /api/auth/firebase
+ * Verifies a Firebase ID token (from Google Sign-In popup on the frontend)
+ * and returns a JWT session cookie. Creates the user in DB if first time.
+ */
+app.post('/api/auth/firebase', async (req: Request, res: Response) => {
+  const { idToken } = req.body;
+  if (!idToken) {
+    return res.status(400).json({ error: 'idToken is required' });
+  }
+
+  if (!getApps().length) {
+    return res.status(503).json({ error: 'Firebase Admin not configured on server' });
+  }
+
+  try {
+    const decoded = await firebaseGetAuth().verifyIdToken(idToken);
+    const email = decoded.email;
+    if (!email) {
+      return res.status(400).json({ error: 'Firebase token has no email' });
+    }
+
+    // Find or create user
+    let user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      user = await prisma.user.create({
+        data: {
+          email,
+          // Random unusable password — Firebase is the auth provider
+          passwordHash: crypto.randomBytes(32).toString('hex'),
+        },
+      });
+    }
+
+    const token = AuthService.generateToken(user.id, user.email, user.username);
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    });
+
+    return res.status(200).json({
+      message: 'Authenticated via Firebase',
+      token,
+      user: { id: user.id, email: user.email, username: user.username },
+    });
+  } catch (err: any) {
+    logger.error('Firebase auth error:', { error: err.message });
+    return res.status(401).json({ error: 'Invalid or expired Firebase token' });
+  }
+});
+
+/**
+ * POST /api/auth/google/check
+ * Checks if a Google account is registered, returning its username if it exists.
+ */
+app.post('/api/auth/google/check', async (req: Request, res: Response) => {
+  const { idToken } = req.body;
+  if (!idToken) {
+    return res.status(400).json({ error: 'idToken is required' });
+  }
+
+  if (!getApps().length) {
+    return res.status(503).json({ error: 'Firebase Admin not configured on server' });
+  }
+
+  try {
+    const decoded = await firebaseGetAuth().verifyIdToken(idToken);
+    const email = decoded.email;
+    if (!email) {
+      return res.status(400).json({ error: 'Firebase token has no email' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (user) {
+      return res.status(200).json({
+        isRegistered: true,
+        username: user.username,
+        email,
+      });
+    } else {
+      return res.status(200).json({
+        isRegistered: false,
+        email,
+      });
+    }
+  } catch (err: any) {
+    logger.error('Google registration check error:', { error: err.message });
+    return res.status(401).json({ error: 'Invalid or expired Firebase token' });
+  }
+});
+
+/**
+ * POST /api/auth/google/register
+ * Registers a new user with Google account verification, username, and password.
+ */
+app.post('/api/auth/google/register', async (req: Request, res: Response) => {
+  const { idToken, username, password } = req.body;
+  if (!idToken || !username || !password) {
+    return res.status(400).json({ error: 'idToken, username, and password are required' });
+  }
+
+  if (username.length < 3) {
+    return res.status(400).json({ error: 'Username must be at least 3 characters long' });
+  }
+
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+  }
+
+  if (!getApps().length) {
+    return res.status(503).json({ error: 'Firebase Admin not configured on server' });
+  }
+
+  try {
+    const decoded = await firebaseGetAuth().verifyIdToken(idToken);
+    const email = decoded.email;
+    if (!email) {
+      return res.status(400).json({ error: 'Firebase token has no email' });
+    }
+
+    // Check if email already registered
+    const existingEmail = await prisma.user.findUnique({
+      where: { email },
+    });
+    if (existingEmail) {
+      return res.status(400).json({ error: 'This Google account is already registered. Please log in.' });
+    }
+
+    // Check if username already taken
+    const existingUsername = await prisma.user.findUnique({
+      where: { username },
+    });
+    if (existingUsername) {
+      return res.status(400).json({ error: 'This username is already taken. Please choose another one.' });
+    }
+
+    const passwordHash = await AuthService.hashPassword(password);
+
+    const user = await prisma.user.create({
+      data: {
+        email,
+        username,
+        passwordHash,
+      },
+    });
+
+    const token = AuthService.generateToken(user.id, user.email, user.username);
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    return res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      user: { id: user.id, email: user.email, username: user.username },
+    });
+  } catch (err: any) {
+    logger.error('Google registration error:', { error: err.message });
+    return res.status(500).json({ error: 'Registration failed: ' + err.message });
+  }
+});
+
+/**
+ * POST /api/auth/google/login
+ * Logs in a user by matching their Google account, username, and password.
+ */
+app.post('/api/auth/google/login', async (req: Request, res: Response) => {
+  const { idToken, username, password } = req.body;
+  if (!idToken || !username || !password) {
+    return res.status(400).json({ error: 'idToken, username, and password are required' });
+  }
+
+  if (!getApps().length) {
+    return res.status(503).json({ error: 'Firebase Admin not configured on server' });
+  }
+
+  try {
+    const decoded = await firebaseGetAuth().verifyIdToken(idToken);
+    const email = decoded.email;
+    if (!email) {
+      return res.status(400).json({ error: 'Firebase token has no email' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: 'You are not registered under this Google account.' });
+    }
+
+    if (user.username !== username) {
+      return res.status(401).json({ error: 'Incorrect username for this Google account.' });
+    }
+
+    const isPasswordValid = await AuthService.comparePassword(password, user.passwordHash);
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Incorrect password.' });
+    }
+
+    const token = AuthService.generateToken(user.id, user.email, user.username);
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    return res.status(200).json({
+      message: 'Logged in successfully',
+      token,
+      user: { id: user.id, email: user.email, username: user.username },
+    });
+  } catch (err: any) {
+    logger.error('Google login error:', { error: err.message });
+    return res.status(401).json({ error: 'Authentication failed: ' + err.message });
+  }
 });
 
 /**
@@ -439,6 +715,7 @@ app.get('/api/users/profile', requireAuth, async (req: AuthenticatedRequest, res
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
+    let newToken: string | undefined;
 
     const cacheKey = `user:profile:${userId}`;
 
@@ -597,6 +874,28 @@ app.post('/api/webhooks/incoming', async (req: Request, res: Response) => {
   }
 });
 
+app.post('/api/telegram/webhook', async (req: Request, res: Response) => {
+  try {
+    // Verify Telegram secret token if configured
+    const secretHeader = req.headers['x-telegram-bot-api-secret-token'];
+    if (TelegramConfig.webhookSecret && secretHeader !== TelegramConfig.webhookSecret) {
+      logger.warn('[TelegramBot] Rejected webhook request with invalid secret token.');
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Process the update asynchronously to respond to Telegram immediately (with 200 OK)
+    TelegramBotService.handleUpdate(req.body).catch((err) => {
+      logger.error('[TelegramBot] Webhook update handling error:', err);
+    });
+
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    logger.error('Telegram webhook endpoint error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
 /**
  * @swagger
  * /api/users/me/settings:
@@ -631,23 +930,23 @@ app.get('/api/users/me/settings', requireAuth, async (req: AuthenticatedRequest,
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
+    let newToken: string | undefined;
 
     const settings = await prisma.userSettings.findUnique({
       where: { userId },
     });
-
-    if (!settings) {
-      return res.status(200).json({
-        theme: 'dark',
-        signature: null,
-        autoReply: false,
-      });
-    }
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { username: true, email: true },
+    });
 
     return res.status(200).json({
-      theme: settings.theme,
-      signature: settings.signature,
-      autoReply: settings.autoReply,
+      theme: settings?.theme ?? 'dark',
+      signature: settings?.signature ?? null,
+      autoReply: settings?.autoReply ?? false,
+      username: user?.username ?? null,
+      email: user?.email ?? '',
+      userId,
     });
   } catch (error) {
     console.error('Fetch settings error:', error);
@@ -663,6 +962,7 @@ const updateSettingsSchema = z.object({
   theme: z.string().min(1).optional(),
   signature: z.string().nullable().optional(),
   autoReply: z.boolean().optional(),
+  username: z.string().min(3).max(30).optional(),
 });
 
 /**
@@ -713,6 +1013,7 @@ app.put('/api/users/me/settings', requireAuth, async (req: AuthenticatedRequest,
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
+    let newToken: string | undefined;
 
     const validation = updateSettingsSchema.safeParse(req.body);
     if (!validation.success) {
@@ -722,7 +1023,32 @@ app.put('/api/users/me/settings', requireAuth, async (req: AuthenticatedRequest,
       });
     }
 
-    const { theme, signature, autoReply } = validation.data;
+    const { theme, signature, autoReply, username } = validation.data;
+
+    if (username) {
+      const existing = await prisma.user.findFirst({
+        where: { username, NOT: { id: userId } },
+      });
+      if (existing) {
+        return res.status(400).json({ error: 'Username is already taken' });
+      }
+
+      await prisma.user.update({
+        where: { id: userId },
+        data: { username },
+      });
+
+      const user = await prisma.user.findUnique({ where: { id: userId } });
+      if (user) {
+        newToken = AuthService.generateToken(user.id, user.email, username);
+        res.cookie('token', newToken, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+          maxAge: 24 * 60 * 60 * 1000,
+        });
+      }
+    }
 
     const updatedSettings = await prisma.userSettings.upsert({
       where: { userId },
@@ -745,6 +1071,7 @@ app.put('/api/users/me/settings', requireAuth, async (req: AuthenticatedRequest,
         theme: updatedSettings.theme,
         signature: updatedSettings.signature,
         autoReply: updatedSettings.autoReply,
+        username: username || null,
       },
     });
   } catch (error) {
@@ -754,11 +1081,26 @@ app.put('/api/users/me/settings', requireAuth, async (req: AuthenticatedRequest,
 });
 
 // OAuth2 & Encryption config
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GMAIL_CLIENT_ID,
-  process.env.GMAIL_CLIENT_SECRET,
-  process.env.GMAIL_REDIRECT_URI || 'http://localhost:8000/api/integrations/gmail/callback'
-);
+const getOAuth2Client = (req?: Request) => {
+  let redirectUri = process.env.GMAIL_REDIRECT_URI;
+  if (!redirectUri && req) {
+    const protocol = process.env.NODE_ENV === 'production' ? 'https' : req.protocol;
+    const host = req.get('host');
+    redirectUri = `${protocol}://${host}/api/integrations/gmail/callback`;
+  }
+  if (!redirectUri) {
+    redirectUri = process.env.RENDER_EXTERNAL_URL 
+      ? `${process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '')}/api/integrations/gmail/callback` 
+      : 'http://localhost:8000/api/integrations/gmail/callback';
+  }
+  return new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET,
+    redirectUri
+  );
+};
+
+const oauth2Client = getOAuth2Client();
 
 /**
  * GET /api/integrations/gmail/auth
@@ -791,7 +1133,8 @@ const oauth2Client = new google.auth.OAuth2(
  *         description: Redirect to Google OAuth consent screen
  */
 app.get('/api/integrations/gmail/auth', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  const url = oauth2Client.generateAuthUrl({
+  const client = getOAuth2Client(req);
+  const url = client.generateAuthUrl({
     access_type: 'offline',
     scope: ['https://mail.google.com/'],
     prompt: 'consent',
@@ -850,10 +1193,11 @@ app.get('/api/integrations/gmail/callback', async (req: Request, res: Response) 
   }
 
   try {
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
+    const client = getOAuth2Client(req);
+    const { tokens } = await client.getToken(code);
+    client.setCredentials(tokens);
 
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const gmail = google.gmail({ version: 'v1', auth: client });
     const profile = await gmail.users.getProfile({ userId: 'me' });
     const emailAddress = profile.data.emailAddress;
 
@@ -879,7 +1223,7 @@ app.get('/api/integrations/gmail/callback', async (req: Request, res: Response) 
       res.cookie('token', jwtToken, {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
         maxAge: 24 * 60 * 60 * 1000,
       });
 
@@ -891,7 +1235,13 @@ app.get('/api/integrations/gmail/callback', async (req: Request, res: Response) 
         create: { userId: user.id, provider: 'gmail', emailAddress, encryptedTokens, syncState: 'connected' }
       });
 
-      return res.redirect('http://localhost:5173/');
+      // Trigger sync in background immediately
+      GmailSyncService.syncLatestEmails(user.id).catch(err => {
+        logger.error('[GmailCallback] Initial Google Sign-in Gmail sync failed:', err);
+      });
+
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      return res.redirect(`${frontendUrl}/dashboard?token=${jwtToken}`);
     }
 
     // ── Connect Gmail to existing account flow ────────────────────────────────
@@ -920,13 +1270,205 @@ app.get('/api/integrations/gmail/callback', async (req: Request, res: Response) 
       }
     });
 
-    return res.status(200).json({ message: 'Gmail connected successfully', emailAddress });
+    // Trigger sync in background immediately
+    GmailSyncService.syncLatestEmails(userId).catch(err => {
+      logger.error('[GmailCallback] Initial Gmail connect sync failed:', err);
+    });
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    return res.redirect(`${frontendUrl}/dashboard/settings?tab=integrations`);
   } catch (error) {
     console.error('OAuth callback error:', error);
     return res.status(500).json({ error: 'OAuth integration failed' });
   }
-
 });
+
+/**
+ * GET /api/integrations/gmail/status
+ * Returns whether the authenticated user has a connected Gmail account.
+ */
+app.get('/api/integrations/gmail/status', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const account = await prisma.emailAccount.findFirst({
+      where: { userId, provider: 'gmail' },
+      select: { emailAddress: true, syncState: true, lastSyncAt: true },
+    });
+
+    if (!account) {
+      return res.json({ connected: false });
+    }
+
+    return res.json({
+      connected: true,
+      emailAddress: account.emailAddress,
+      syncState: account.syncState,
+      lastSyncAt: account.lastSyncAt,
+    });
+  } catch (error) {
+    console.error('Gmail status error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/integrations/gmail/sync
+ * Fetches the latest 50 unread Gmail messages for the authenticated user
+ * and stores them in the Email table.
+ */
+app.post('/api/integrations/gmail/sync', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const account = await prisma.emailAccount.findFirst({
+      where: { userId, provider: 'gmail' },
+    });
+
+    if (!account) {
+      return res.status(400).json({ error: 'No Gmail account connected. Please connect Gmail first.' });
+    }
+
+    // Decrypt stored tokens
+    let tokens: any;
+    try {
+      tokens = JSON.parse(decrypt(account.encryptedTokens));
+    } catch (e) {
+      return res.status(400).json({ error: 'Failed to decrypt Gmail tokens. Please reconnect Gmail.' });
+    }
+
+    // Build authenticated Gmail client with stored tokens
+    const userOAuth = new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID,
+      process.env.GMAIL_CLIENT_SECRET,
+      process.env.GMAIL_REDIRECT_URI
+    );
+    userOAuth.setCredentials(tokens);
+
+    // Auto-refresh token if expired
+    userOAuth.on('tokens', async (newTokens) => {
+      const merged = { ...tokens, ...newTokens };
+      const encrypted = encrypt(JSON.stringify(merged));
+      await prisma.emailAccount.update({
+        where: { id: account.id },
+        data: { encryptedTokens: encrypted },
+      });
+    });
+
+    const gmail = google.gmail({ version: 'v1', auth: userOAuth });
+
+    // Fetch list of latest 50 messages
+    const listRes = await gmail.users.messages.list({
+      userId: 'me',
+      maxResults: 50,
+      q: 'in:inbox',
+    });
+
+    const messages = listRes.data.messages || [];
+    if (messages.length === 0) {
+      await prisma.emailAccount.update({
+        where: { id: account.id },
+        data: { lastSyncAt: new Date() },
+      });
+      return res.json({ synced: 0, message: 'No messages found in inbox.' });
+    }
+
+    let syncedCount = 0;
+
+    for (const msg of messages) {
+      if (!msg.id) continue;
+
+      // Skip if already stored
+      const existing = await prisma.email.findUnique({ where: { messageId: msg.id } });
+      if (existing) continue;
+
+      try {
+        const fullMsg = await gmail.users.messages.get({
+          userId: 'me',
+          id: msg.id,
+          format: 'full',
+        });
+
+        const headers = fullMsg.data.payload?.headers || [];
+        const getHeader = (name: string) =>
+          headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || '';
+
+        const subject = getHeader('Subject') || '(no subject)';
+        const from = getHeader('From') || 'unknown@unknown.com';
+        const to = getHeader('To') || account.emailAddress;
+        const messageId = getHeader('Message-ID') || msg.id;
+        const inReplyTo = getHeader('In-Reply-To') || null;
+
+        // Extract plain text body
+        let body = '';
+        const extractBody = (part: any): string => {
+          if (part.mimeType === 'text/plain' && part.body?.data) {
+            return Buffer.from(part.body.data, 'base64url').toString('utf-8');
+          }
+          if (part.parts) {
+            for (const p of part.parts) {
+              const text = extractBody(p);
+              if (text) return text;
+            }
+          }
+          return '';
+        };
+
+        if (fullMsg.data.payload) {
+          body = extractBody(fullMsg.data.payload);
+        }
+        if (!body && fullMsg.data.snippet) {
+          body = fullMsg.data.snippet;
+        }
+
+        // Find or create thread
+        let threadId: string | null = null;
+        if (inReplyTo) {
+          const prev = await prisma.email.findUnique({ where: { messageId: inReplyTo } });
+          if (prev) threadId = prev.threadId;
+        }
+        if (!threadId) {
+          const newThread = await prisma.thread.create({
+            data: { summary: `Thread: ${subject}` },
+          });
+          threadId = newThread.id;
+        }
+
+        const emailRecord = await prisma.email.create({
+          data: {
+            messageId,
+            inReplyTo,
+            sender: from,
+            recipient: to,
+            subject,
+            body,
+            status: 'UNREAD',
+            userId,
+            threadId,
+          },
+        });
+        syncedCount++;
+        await EventBus.publish('email.received', { emailId: emailRecord.id });
+      } catch (msgErr: any) {
+        console.warn(`Failed to sync message ${msg.id}:`, msgErr.message);
+      }
+    }
+
+    // Update last sync time
+    await prisma.emailAccount.update({
+      where: { id: account.id },
+      data: { lastSyncAt: new Date() },
+    });
+
+    return res.json({ synced: syncedCount, total: messages.length });
+  } catch (error: any) {
+    console.error('Gmail sync error:', error.message);
+    return res.status(500).json({ error: 'Gmail sync failed. ' + error.message });
+  }
+});
+
 
 /**
  * POST /api/emails/send
@@ -1089,7 +1631,7 @@ app.get('/api/webhooks/config', requireAuth, async (req: AuthenticatedRequest, r
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const hooks = await prisma.webhookEndpoint.findMany({ where: { userId } });
-    const formatted = hooks.map(h => ({ id: h.id, targetUrl: h.targetUrl, events: JSON.parse(h.events) }));
+    const formatted = hooks.map((h: { id: string; targetUrl: string; events: string }) => ({ id: h.id, targetUrl: h.targetUrl, events: JSON.parse(h.events) }));
     return res.json(formatted);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch webhooks' });
@@ -1346,6 +1888,7 @@ app.get('/api/emails/:id', requireAuth, async (req: AuthenticatedRequest, res: R
       where: { id },
       include: {
         actionItems: true,
+        analysis: true,
         thread: {
           include: {
             emails: {
@@ -1684,7 +2227,7 @@ app.put('/api/rules/:id', requireAuth, async (req: AuthenticatedRequest, res: Re
     const { name, description, priority, conditions, actions } = validation.data;
 
     // Run delete-then-create inside a transaction
-    const updatedRule = await prisma.$transaction(async (tx) => {
+    const updatedRule = await prisma.$transaction(async (tx: any) => {
       await tx.ruleCondition.deleteMany({ where: { ruleId: id } });
       await tx.ruleAction.deleteMany({ where: { ruleId: id } });
 
@@ -1878,7 +2421,8 @@ app.post('/api/rules/:id/toggle', requireAuth, async (req: AuthenticatedRequest,
  *         description: Redirect to Google OAuth URL
  */
 app.get('/api/auth/google', (req: Request, res: Response) => {
-  const url = oauth2Client.generateAuthUrl({
+  const client = getOAuth2Client(req);
+  const url = client.generateAuthUrl({
     access_type: 'offline',
     scope: ['https://mail.google.com/', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile'],
     prompt: 'consent',
@@ -1903,6 +2447,16 @@ app.use('/api/tasks', tasksRouter);
 
 const server = app.listen(PORT, () => {
   logger.info(`Auth service running on port ${PORT}`);
+
+  // Initialize Telegram Bot Service
+  TelegramBotService.init().catch((err) => {
+    logger.error('Failed to initialize Telegram Bot Service:', err);
+  });
+
+  // Register inline worker handlers to handle BullMQ/Redis tasks
+  registerWorkerHandlers().catch((err) => {
+    logger.error('Failed to register inline worker handlers:', err);
+  });
   
   // Register EventBus fallback handler AFTER server is listening
   // to avoid blocking startup if Redis is slow or unavailable.
@@ -1918,7 +2472,18 @@ const server = app.listen(PORT, () => {
 const io = new SocketIoServer(server, {
   cors: {
     origin: (origin: any, callback: any) => {
-      if (!origin || origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+      const originClean = origin.replace(/\/$/, '');
+      const isVercelPreview = originClean.startsWith('https://inbox-os-frontend') && originClean.endsWith('.vercel.app');
+      const isAllowed = isVercelPreview || allowedOrigins.some(o => 
+        originClean === o || 
+        (o.startsWith('http://localhost') && originClean.startsWith('http://localhost:')) ||
+        (o.startsWith('http://127.0.0.1') && originClean.startsWith('http://127.0.0.1:'))
+      );
+      if (isAllowed) {
         callback(null, true);
       } else {
         callback(new Error('Not allowed by CORS'));

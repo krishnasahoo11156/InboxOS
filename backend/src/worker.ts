@@ -50,7 +50,13 @@ reminderWorker.on('failed', (job, err) => {
   console.error(`[BullMQ] Reminder Job ${job?.id} failed with error:`, err);
 });
 
+let isRegistered = false;
+
 export async function registerWorkerHandlers() {
+  if (isRegistered) {
+    return;
+  }
+  isRegistered = true;
   logger.info('Registering email processing workers...');
 
   // Subscribe to 'email.received' topic
@@ -90,8 +96,29 @@ export async function registerWorkerHandlers() {
           },
         });
 
+        // 3.5 Create or update EmailAnalysis record
+        await prisma.emailAnalysis.upsert({
+          where: { emailId: email.id },
+          create: {
+            emailId: email.id,
+            category: result.category,
+            confidenceScore: result.confidence,
+            deadlines: result.deadlines || [],
+            priorityScore: result.category === 'urgent' ? 90.0 : 50.0,
+            urgencyScore: result.category === 'urgent' ? 90.0 : 50.0,
+            actionabilityScore: 50.0,
+            aiProvider: process.env.AI_PROVIDER || 'openai',
+          },
+          update: {
+            category: result.category,
+            confidenceScore: result.confidence,
+            deadlines: result.deadlines || [],
+            aiProvider: process.env.AI_PROVIDER || 'openai',
+          },
+        });
+
         logger.info(
-          '[Worker] Email classification updated successfully in database',
+          '[Worker] Email classification and analysis updated successfully in database',
           { emailId }
         );
 
@@ -163,7 +190,7 @@ export async function registerWorkerHandlers() {
           await prisma.actionItem.createMany({
             data: actionItems.map((item) => ({
               emailId: email.id,
-              taskDescription: item.taskDescription,
+              taskDescription: item.taskDescription || '',
               isCompleted: false,
               deadline: item.deadline ? new Date(item.deadline) : null,
             })),
